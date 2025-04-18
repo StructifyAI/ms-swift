@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeAlias, Union
 
 import datasets
 import numpy as np
+from pandas import DataFrame
 import torch
 import torch.nn as nn
 import transformers
@@ -195,6 +196,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'prompt': deque(maxlen=maxlen),
             'completion': deque(maxlen=maxlen),
             'rewards': defaultdict(lambda: deque(maxlen=maxlen)),
+            'inputs': deque(maxlen=maxlen),
         }
 
         num_processes = self.accelerator.num_processes
@@ -814,7 +816,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         return inputs
 
     def _generate_and_score_completions(self, inputs: InputsType) -> InputsType:
-
+        # Save original raw inputs for logging
+        raw_inputs = inputs
         inputs = self._generate_completions(inputs)
         total_rewards_per_func, total_rewards, completions = self._score_completions(inputs)
         mode = 'eval' if self.control.should_evaluate else 'train'
@@ -829,7 +832,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log metrics
         messages = [inputs[i]['messages'][:-1] for i in range(len(inputs))]
 
-        self._log_metrics(batch_encoded_inputs, messages, completions, total_rewards, total_rewards_per_func)
+        self._log_metrics(batch_encoded_inputs, messages, completions, total_rewards, total_rewards_per_func, raw_inputs)
 
         return batch_encoded_inputs
 
@@ -976,7 +979,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         return batch_encoded_inputs
 
-    def _log_metrics(self, inputs, messages, completions, rewards, rewards_per_func):
+    def _log_metrics(self, inputs, messages, completions, rewards, rewards_per_func, raw_inputs=None):
         """Log training/evaluation metrics"""
         mode = 'eval' if self.control.should_evaluate else 'train'
         device = self.accelerator.device
@@ -1022,7 +1025,12 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log prompt and completion texts
         self._textual_logs['prompt'].extend(gather_object(messages))
         self._textual_logs['completion'].extend(gather_object(completions))
-
+        # Log raw inputs per example to match prompt/completion lengths
+        if raw_inputs is not None:
+            self._textual_logs['inputs'].extend(gather_object(raw_inputs))
+        else:
+            self._textual_logs['inputs'].extend(gather_object(inputs))
+        
         for i, name in enumerate(reward_func_names):
             self._textual_logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
 
@@ -1344,11 +1352,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             super().log(logs)
         self._metrics[mode].clear()
 
+        import json
         if self.accelerator.is_main_process and self.log_completions:
             table = {
                 'step': [str(self.state.global_step)] * len(self._textual_logs['prompt']),
                 'prompt': self._textual_logs['prompt'],
                 'completion': self._textual_logs['completion'],
+                'inputs': [json.dumps(i) for i in self._textual_logs['inputs']],
                 **self._textual_logs['rewards'],
             }
             self.jsonl_writer.append(table)
@@ -1359,7 +1369,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 import pandas as pd
                 df = pd.DataFrame(table)
                 if self.args.wandb_log_unique_prompts:
-                    df = df.drop_duplicates(subset=['prompt'])
+                    df: DataFrame = df.drop_duplicates(subset=['prompt'])
                 wandb.log({'completions': wandb.Table(dataframe=df)})
             elif self.args.report_to and 'neptune' in self.args.report_to:
                 import pandas as pd
