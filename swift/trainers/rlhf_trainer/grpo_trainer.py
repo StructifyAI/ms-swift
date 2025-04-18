@@ -1352,12 +1352,21 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 **self._textual_logs['rewards'],
             }
             self.jsonl_writer.append(table)
+
+            from transformers.integrations import NeptuneCallback
+            from neptune.types import File
             if self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None:
                 import pandas as pd
                 df = pd.DataFrame(table)
                 if self.args.wandb_log_unique_prompts:
                     df = df.drop_duplicates(subset=['prompt'])
                 wandb.log({'completions': wandb.Table(dataframe=df)})
+            elif self.args.report_to and 'neptune' in self.args.report_to:
+                import pandas as pd
+                df = pd.DataFrame(table)
+                run = NeptuneCallback.get_run(self)
+                if run is not None:
+                    run["data/completions"].upload(File.as_html(df))
 
     def is_async_generate_eval_rollout_done(self):
         return not self.eval_flag or not self.eval_queue.empty()
