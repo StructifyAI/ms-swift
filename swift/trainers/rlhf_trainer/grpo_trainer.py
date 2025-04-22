@@ -200,7 +200,11 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'prompt': deque(maxlen=maxlen),
             'completion': deque(maxlen=maxlen),
             'rewards': defaultdict(lambda: deque(maxlen=maxlen)),
+            'inputs': deque(maxlen=maxlen),
+            'raw_inputs': deque(maxlen=maxlen),
         }
+        # Placeholder to store untokenized inputs for JSONL logging
+        self._logging_raw_inputs = None
 
         num_processes = self.accelerator.num_processes
         self.global_train_batch_size = global_batch_size = args.per_device_train_batch_size * num_processes
@@ -834,7 +838,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log metrics
         messages = [inputs[i]['messages'][:-1] for i in range(len(inputs))]
 
-        self._log_metrics(batch_encoded_inputs, messages, completions, total_rewards, total_rewards_per_func)
+        self._log_metrics(batch_encoded_inputs, messages, completions, total_rewards, total_rewards_per_func, raw_inputs=inputs)
 
         return batch_encoded_inputs
 
@@ -981,7 +985,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         return batch_encoded_inputs
 
-    def _log_metrics(self, inputs, messages, completions, rewards, rewards_per_func):
+    def _log_metrics(self, inputs, messages, completions, rewards, rewards_per_func, raw_inputs=None):
         """Log training/evaluation metrics"""
         mode = 'eval' if self.control.should_evaluate else 'train'
         device = self.accelerator.device
@@ -1027,6 +1031,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log prompt and completion texts
         self._textual_logs['prompt'].extend(gather_object(messages))
         self._textual_logs['completion'].extend(gather_object(completions))
+        self._textual_logs['inputs'].extend(inp for inp, mask in zip(gather_object(inputs), metrics_mask) if mask)
+        if raw_inputs is not None:
+            self._textual_logs['raw_inputs'].extend(r for r, mask in zip(gather_object(raw_inputs), metrics_mask) if mask)
 
         for i, name in enumerate(reward_func_names):
             self._textual_logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
@@ -1150,7 +1157,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self.optimizer.train()
 
         batch_inputs = self._prepare_inputs(inputs)
-
         total_loss = torch.tensor(0.0, device=batch_inputs[0]['input_ids'].device)
         # Initialize metrics accumulators
         total_kl = 0.0
@@ -1354,6 +1360,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'step': [str(self.state.global_step)] * len(self._textual_logs['prompt']),
                 'prompt': self._textual_logs['prompt'],
                 'completion': self._textual_logs['completion'],
+                'inputs': self._textual_logs['inputs'],
+                'raw_inputs': self._textual_logs['raw_inputs'],
                 **self._textual_logs['rewards'],
             }
             self.jsonl_writer.append(table)

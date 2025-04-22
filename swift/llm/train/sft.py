@@ -37,7 +37,15 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         HfConfigFactory.set_model_config_attr(self.model, 'use_cache', False)
         if args.gradient_checkpointing:
             self.model.supports_gradient_checkpointing = True
-            dynamic_gradient_checkpointing(self.model)
+            # Use HF native gradient checkpointing for compatibility with DDP
+            self.model.gradient_checkpointing_enable()
+            # disable gradient checkpointing for LoRA adapter modules to prevent double backward hooks
+            for module in self.model.modules():
+                if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                    try:
+                        module.gradient_checkpointing = False
+                    except Exception:
+                        pass
             self.model.enable_input_require_grads()
         model_meta = self.model.model_meta
         model_arch = get_model_arch(model_meta.model_arch)
@@ -57,7 +65,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                                                                  args.get_request_config(), self.tokenizer)
         logger.info(f'model.generation_config: {self.model.generation_config}')
 
-    def _prepare_model_tokenizer(self):
+    def _prepare_model_tokenizer(self) -> None:
         args = self.args
         self.model, self.processor = args.get_model_processor()
 
@@ -67,6 +75,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         logger.info(f'model_info: {self.model.model_info}')
 
         self._prepare_generation_config()
+        # Always enable gradient checkpointing (using HF native API)
         self._prepare_gradient_checkpointing()
 
     def _prepare_template(self) -> None:

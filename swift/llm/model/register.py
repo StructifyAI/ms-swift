@@ -293,6 +293,13 @@ def fix_do_sample_warning(generation_config: GenerationConfig) -> None:
 def get_default_device_map():
     if is_deepspeed_zero3_enabled() or os.environ.get('ACCELERATE_USE_FSDP', 'False') == 'true':
         return None
+    # DDP: if world_size >1, place full model on each local GPU
+    rank, local_rank, world_size, local_world_size = get_dist_setting()
+    if world_size > 1:
+        if local_rank == -1:
+            local_rank = 0
+        return f"cuda:{local_rank}"
+    # single-process fallback
     local_rank = get_dist_setting()[1]
     if local_rank == -1:
         local_rank = 0
