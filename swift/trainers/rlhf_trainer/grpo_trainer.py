@@ -1031,10 +1031,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log prompt and completion texts
         self._textual_logs['prompt'].extend(gather_object(messages))
         self._textual_logs['completion'].extend(gather_object(completions))
-        self._textual_logs['inputs'].extend(inp for inp, mask in zip(gather_object(inputs), metrics_mask) if mask)
+        self._textual_logs['inputs'].extend(gather_object(inputs))
         if raw_inputs is not None:
-            self._textual_logs['raw_inputs'].extend(r for r, mask in zip(gather_object(raw_inputs), metrics_mask) if mask)
-
+            self._textual_logs['raw_inputs'].extend(gather_object(raw_inputs))
         for i, name in enumerate(reward_func_names):
             self._textual_logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
 
@@ -1139,7 +1138,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._prefetch(dataloader)
         metric_key_prefix = kwargs['metric_key_prefix']
         output = super().evaluation_loop(dataloader, *args, **kwargs)
-        metrics = {f'{metric_key_prefix}_{key}': sum(val) / len(val) for key, val in self._metrics['eval'].items()}
+        metrics = {f'{metric_key_prefix}_{key}': sum(val) / len(val) for key, val in self._metrics['eval'].items() if len(val) > 0}
         output.metrics.update(metrics)
         self.args.mini_batch_size = mini_batch_size
         self.eval_flag = True
@@ -1341,7 +1340,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # remove this function when next trl release(0.17.0)
 
         mode = 'eval' if self.control.should_evaluate else 'train'
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items() if len(val) > 0}  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
