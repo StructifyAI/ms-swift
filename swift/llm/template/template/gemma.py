@@ -109,7 +109,11 @@ class Gemma3VisionTemplate(Gemma3Template):
             input_ids = encoded['input_ids']
             labels = encoded['labels']
             idx_list = findall(input_ids, self.boi_token_id)
-            img_tokens = self._tokenize(self.processor.full_image_sequence)
+            # To deal with variable length image tokens - this isn't quite right, but close eough.
+            img_tokens = self.processor(text=["<start_of_image>"], images=inputs.images)['input_ids']
+            decoded = self.processor.decode(img_tokens[0])
+            decoded = decoded.replace("<bos>", "")
+            img_tokens = self.tokenizer.encode(decoded)
             input_ids, labels = self._extend_tokens(input_ids, labels, idx_list, lambda _: img_tokens)
 
             # TODO: customize
