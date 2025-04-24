@@ -600,7 +600,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         from swift.llm.infer.protocol import ChatCompletionResponse
         rank, _, _, _ = get_dist_setting()
         request_config = copy(request_config)
-        breakpoint()
         results: List[ChatCompletionResponse] = self._engine_infer(
             infer_requests=inputs_slice, request_config=request_config, use_tqdm=False)
         prompt_lens = len(inputs_slice)
