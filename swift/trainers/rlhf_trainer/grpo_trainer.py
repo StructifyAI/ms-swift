@@ -600,6 +600,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         from swift.llm.infer.protocol import ChatCompletionResponse
         rank, _, _, _ = get_dist_setting()
         request_config = copy(request_config)
+        breakpoint()
         results: List[ChatCompletionResponse] = self._engine_infer(
             infer_requests=inputs_slice, request_config=request_config, use_tqdm=False)
         prompt_lens = len(inputs_slice)
@@ -668,7 +669,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 for choice in output.choices:
                     _input: Dict = deepcopy(inputs_slice[i])
                     InferRequest.remove_response(_input['messages'])
-                    _input['messages'].append({'role': 'assistant', 'content': choice.message.content})
+                    _input['messages'].append({'role': 'assistant', 'content': choice.message.content.replace("<start_of_image>", "<not_start_of_image>")})
                     _choices.append((_input['messages'], choice.finish_reason))
                 outputs.append(_choices)
             assert len(outputs) == prompt_lens
