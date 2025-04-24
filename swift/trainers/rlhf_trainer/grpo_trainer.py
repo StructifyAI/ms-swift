@@ -195,6 +195,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'prompt': deque(maxlen=maxlen),
             'completion': deque(maxlen=maxlen),
             'rewards': defaultdict(lambda: deque(maxlen=maxlen)),
+            'inputs': deque(maxlen=maxlen),
+            'raw_inputs': deque(maxlen=maxlen),
         }
 
         num_processes = self.accelerator.num_processes
@@ -1031,7 +1033,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log prompt and completion texts
         self._textual_logs['prompt'].extend(gather_object(messages))
         self._textual_logs['completion'].extend(gather_object(completions))
-
+        self._textual_logs['inputs'].extend(gather_object(inputs))
+        if raw_inputs is not None:
+            self._textual_logs['raw_inputs'].extend(gather_object(raw_inputs))
         for i, name in enumerate(reward_func_names):
             self._textual_logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
 
@@ -1383,6 +1387,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'step': [str(self.state.global_step)] * len(self._textual_logs['prompt']),
                 'prompt': self._textual_logs['prompt'],
                 'completion': self._textual_logs['completion'],
+                'inputs': self._textual_logs['inputs'],
+                'raw_inputs': self._textual_logs['raw_inputs'],
                 **self._textual_logs['rewards'],
             }
             self.jsonl_writer.append(table)
