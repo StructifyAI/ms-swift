@@ -840,7 +840,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Log metrics
         messages = [inputs[i]['messages'][:-1] for i in range(len(inputs))]
 
-        self._log_metrics(batch_encoded_inputs, messages, completions, total_rewards, total_rewards_per_func)
+        self._log_metrics(batch_encoded_inputs, messages, completions, total_rewards, total_rewards_per_func, raw_inputs=inputs)
 
         return batch_encoded_inputs
 
@@ -987,7 +987,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         return batch_encoded_inputs
 
-    def _log_metrics(self, inputs, messages, completions, rewards, rewards_per_func):
+    def _log_metrics(self, inputs, messages, completions, rewards, rewards_per_func, raw_inputs=None):
         """Log training/evaluation metrics"""
         mode = 'eval' if self.control.should_evaluate else 'train'
         device = self.accelerator.device
@@ -1368,7 +1368,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # remove this function when next trl release(0.17.0)
 
         mode = 'eval' if self.control.should_evaluate else 'train'
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items() if len(val) > 0}  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
