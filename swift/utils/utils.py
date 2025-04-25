@@ -34,7 +34,7 @@ def check_json_format(obj: Any, token_safe: bool = True) -> Any:
 
     if isinstance(obj, Sequence):
         res = []
-        for x in obj:
+        for x in list(obj):
             res.append(check_json_format(x, token_safe))
     elif isinstance(obj, Mapping):
         res = {}
