@@ -844,7 +844,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         return batch_encoded_inputs
 
-    def _score_completions(self, inputs: InputsType) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    def _score_completions(self, inputs: InputsType, post_score_hook: Optional[Callable] = None) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
         """Score completions using all reward functions
 
         Args:
@@ -876,6 +876,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 output_reward_func = reward_func(completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
+        if post_score_hook is not None:
+            post_score_hook(inputs, rewards_per_func, completions)
+
+        # Now synchronize across workers.
         total_rewards_per_func = gather(rewards_per_func)
         total_rewards = (total_rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
@@ -893,7 +897,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         origin_data = (inputs, rewards, rewards_per_func, completions)
 
         while resample_count < self.args.max_resample_times:
+            # Let the caller optionally adjust the rewards & decide whether we
+            # should keep sampling *before* we compute per-group statistics.
             grouped_rewards = rewards.view(-1, self.num_generations)
+
             group_std = grouped_rewards.std(dim=1)
 
             valid_mask = (group_std > 0).repeat_interleave(self.num_generations)
@@ -936,7 +943,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         std_grouped_rewards = grouped_rewards.std(dim=1).repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards)
         if self.args.scale_rewards:
-            advantages /= (std_grouped_rewards + 1e-4)
+            safe_std = torch.clamp(std_grouped_rewards, min=1e-2)
+            advantages = advantages / (safe_std + 1e-4)
 
         # Slice to keep only the local part of the data
         process_slice = slice(
