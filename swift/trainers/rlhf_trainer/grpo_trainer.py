@@ -167,6 +167,11 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         else:
             self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
 
+        # Running statistics for per-component whitening (mean≈0, std≈1)
+        self.rwd_mean = torch.zeros(len(self.reward_funcs), dtype=torch.float32)
+        self.rwd_var = torch.ones(len(self.reward_funcs), dtype=torch.float32)
+        self.rwd_ema_coeff = 0.97  # exponential-moving-average factor
+
         self.num_generations = args.num_generations
         self.temperature = args.temperature
         model.warnings_issued['estimate_tokens'] = True
@@ -881,7 +886,33 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         # Now synchronize across workers.
         total_rewards_per_func = gather(rewards_per_func)
-        total_rewards = (total_rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+
+        # -----------------------------------------------------------------
+        # Per-component whitening so that each reward contributes comparable
+        # variance regardless of its raw scale or sparsity.  Keeps running
+        # mean/var with an EMA so statistics stay stable across the run.
+        # -----------------------------------------------------------------
+        ema = self.rwd_ema_coeff
+        if self.rwd_mean.device != device:
+            # move running stats once we know the compute device
+            self.rwd_mean = self.rwd_mean.to(device)
+            self.rwd_var = self.rwd_var.to(device)
+
+        batch_mean = total_rewards_per_func.mean(dim=0)
+        batch_var = total_rewards_per_func.var(dim=0, unbiased=False)
+
+        self.rwd_mean = ema * self.rwd_mean + (1.0 - ema) * batch_mean
+        self.rwd_var = ema * self.rwd_var + (1.0 - ema) * batch_var
+
+        # Robustify the std calculation to prevent instability
+        # Use a larger epsilon and clamp to minimum to prevent division by near-zero
+        # This is especially important for parse rewards that are often 1.0 
+        # but occasionally drop to 0.0, causing instability
+        std = torch.sqrt(self.rwd_var + 1e-4)
+        std = torch.clamp(std, min=0.1)  # Minimum std to prevent over-amplification
+        normed_rewards = (total_rewards_per_func - self.rwd_mean) / std
+
+        total_rewards = (normed_rewards * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
 
         return total_rewards_per_func, total_rewards, completions
 
@@ -1033,6 +1064,21 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             std_rewards = rewards_per_func[:, i].std().item()
             self._metrics[mode][f'rewards/{reward_func_name}/std'].append(std_rewards)
 
+            # Log warning for parse-related rewards that drop significantly
+            if 'parse' in reward_func_name.lower() or 'json' in reward_func_name.lower():
+                if mean_rewards < 0.9:  # Parse rewards should typically be near 1.0
+                    logger.warning(
+                        f"Parse reward {reward_func_name} dropped to {mean_rewards:.3f} "
+                        f"(std: {std_rewards:.3f}) at step {self.state.global_step}"
+                    )
+                    # Log a few failed completions for debugging
+                    failed_indices = (rewards_per_func[:, i] < 0.5).nonzero(as_tuple=True)[0]
+                    if len(failed_indices) > 0:
+                        for idx in failed_indices[:3]:  # Log up to 3 failures
+                            logger.warning(
+                                f"Failed completion example: {completions[idx][:200]}..."
+                            )
+
         # Log overall reward stats
         grouped_rewards = rewards.view(-1, self.num_generations)
         self._metrics[mode]['reward'].append(grouped_rewards.mean().item())
@@ -1073,10 +1119,23 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         advantages = inputs['advantages']
         old_per_token_logps = inputs['old_per_token_logps'] if self.old_policy else per_token_logps.detach()
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        # Cap importance weights to prevent outliers from destabilizing training
+        # When a single completion gets a huge negative reward and has large Δlog p,
+        # it can dominate the PPO update and cause parse failures
+        max_importance_weight = 10.0
+        coef_1 = torch.clamp(coef_1, max=max_importance_weight)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        # PPO clipping: for positive advantages we use the minimum (conservative),
+        # for negative advantages we should use the maximum.  Using `min` for both
+        # cases over-penalises negative advantages and can blow up gradients.
+        adv_unsq = advantages.unsqueeze(1)
+        per_token_loss = torch.where(
+            adv_unsq >= 0,
+            -torch.min(per_token_loss1, per_token_loss2),  # standard PPO branch (A>0)
+            -torch.max(per_token_loss1, per_token_loss2),  # correct branch for A<0
+        )
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
@@ -1088,6 +1147,16 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         # Log the metrics
         metrics = {}
+        # ----------------- DEBUG METRICS -----------------
+        # 1. Maximum absolute importance weight (exp(Δlog p)) seen in this mini-batch.
+        max_coef1 = coef_1.abs().max()
+        metrics['debug/max_coef1'] = max_coef1
+
+        # 2. (Approximate) minimum completion length for the current mini-batch.
+        #    We log the total token count so we can spot tiny completions that can
+        #    inflate the loss after averaging.
+        metrics['debug/min_completion_len'] = completions_length.float()
+        # --------------------------------------------------
         mode = 'eval' if self.control.should_evaluate else 'train'
 
         if self.beta != 0.0:
@@ -1172,6 +1241,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         total_kl = 0.0
         total_clip_ratio = 0.0
         total_completion_length = 0
+        total_max_coef1 = 0.0  # for debug/max_coef1
+        total_min_comp_len = 0.0  # for debug/min_completion_len (mean over tokens)
         for mini_batch in batch_inputs:
 
             with self.compute_loss_context_manager():
@@ -1186,6 +1257,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             total_completion_length += mb_completion_length
             total_loss += mini_batch_loss * mb_completion_length
 
+            # ----------------- DEBUG METRICS ACCUM -----------------
+            total_max_coef1 += mini_batch_metrics['debug/max_coef1'] * mb_completion_length
+            total_min_comp_len += mini_batch_metrics['debug/min_completion_len'] * mb_completion_length
+
         mode = 'eval' if self.control.should_evaluate else 'train'
         if self.beta != 0.0:
             self._metrics[mode]['kl'].append(
@@ -1199,6 +1274,12 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if (self.args.torch_empty_cache_steps is not None
                 and self.state.global_step % self.args.torch_empty_cache_steps == 0):
             gc_collect()
+
+        # Log the aggregated debug metrics so they show up in dashboards.
+        self._metrics[mode]['debug/max_coef1'].append(
+            self.accelerator.gather_for_metrics(total_max_coef1 / total_completion_length).mean().item())
+        self._metrics[mode]['debug/min_completion_len'].append(
+            self.accelerator.gather_for_metrics(total_min_comp_len / total_completion_length).mean().item())
 
         return total_loss.detach()
 
