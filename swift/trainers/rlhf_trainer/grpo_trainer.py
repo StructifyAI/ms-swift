@@ -1071,13 +1071,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         f"Parse reward {reward_func_name} dropped to {mean_rewards:.3f} "
                         f"(std: {std_rewards:.3f}) at step {self.state.global_step}"
                     )
-                    # Log a few failed completions for debugging
-                    failed_indices = (rewards_per_func[:, i] < 0.5).nonzero(as_tuple=True)[0]
-                    if len(failed_indices) > 0:
-                        for idx in failed_indices[:3]:  # Log up to 3 failures
-                            logger.warning(
-                                f"Failed completion example: {completions[idx][:200]}..."
-                            )
 
         # Log overall reward stats
         grouped_rewards = rewards.view(-1, self.num_generations)
