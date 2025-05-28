@@ -977,6 +977,11 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             safe_std = torch.clamp(std_grouped_rewards, min=1e-2)
             advantages = advantages / (safe_std + 1e-4)
 
+        # Clip advantages to prevent gradient explosion
+        # Even with other protections, extreme advantages can cause instability
+        max_advantage = 10.0  # Conservative clipping
+        advantages = torch.clamp(advantages, -max_advantage, max_advantage)
+
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(inputs),
@@ -1115,7 +1120,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Cap importance weights to prevent outliers from destabilizing training
         # When a single completion gets a huge negative reward and has large Δlog p,
         # it can dominate the PPO update and cause parse failures
-        max_importance_weight = 10.0
+        max_importance_weight = 2.0  # More aggressive capping to prevent gradient explosion
         coef_1 = torch.clamp(coef_1, max=max_importance_weight)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
@@ -1136,7 +1141,20 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if completions_length == 0:
             # Prevent division by zero issues after all completions are filtered by the overlong filter
             completions_length = completions_length.float() + 1e-4
+        else:
+            # Prevent amplification from very short completions
+            # Ensure minimum effective length to avoid gradient explosion
+            min_completion_length = 10.0  # Minimum tokens to average over
+            completions_length = torch.clamp(completions_length.float(), min=min_completion_length)
         loss = (per_token_loss * completion_mask).sum() / completions_length
+
+        # Check for numerical instability
+        if not torch.isfinite(loss):
+            logger.warning(f"Non-finite loss detected: {loss.item()}, resetting to 0")
+            loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+        elif loss.abs() > 1000.0:  # Extremely high loss
+            logger.warning(f"Extremely high loss detected: {loss.item()}, clamping")
+            loss = torch.clamp(loss, -1000.0, 1000.0)
 
         # Log the metrics
         metrics = {}
@@ -1149,6 +1167,14 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         #    We log the total token count so we can spot tiny completions that can
         #    inflate the loss after averaging.
         metrics['debug/min_completion_len'] = completions_length.float()
+        
+        # 3. Track extreme advantages that could cause gradient explosion
+        metrics['debug/max_advantage'] = advantages.abs().max()
+        metrics['debug/advantage_std'] = advantages.std() if advantages.numel() > 1 else torch.tensor(0.0)
+        
+        # 4. Track per-token loss statistics
+        metrics['debug/max_per_token_loss'] = per_token_loss.abs().max()
+        metrics['debug/per_token_loss_std'] = per_token_loss.std() if per_token_loss.numel() > 1 else torch.tensor(0.0)
         # --------------------------------------------------
         mode = 'eval' if self.control.should_evaluate else 'train'
 
@@ -1229,6 +1255,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         batch_inputs = self._prepare_inputs(inputs)
 
+        mode = 'eval' if self.control.should_evaluate else 'train'
         total_loss = torch.tensor(0.0, device=batch_inputs[0]['input_ids'].device)
         # Initialize metrics accumulators
         total_kl = 0.0
@@ -1243,6 +1270,19 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 mb_completion_length = mini_batch_metrics['completions_length']
 
             self.accelerator.backward(mini_batch_loss)
+            
+            # Clip gradients after each mini-batch to prevent explosion during accumulation
+            if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+                # Unscale gradients before clipping (important for FP16/BF16)
+                self.accelerator.unscale_gradients(self.optimizer)
+                # Clip gradients
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.args.max_grad_norm
+                )
+                # Log the gradient norm for debugging
+                self._metrics[mode]['grad_norm'].append(grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm)
+                
             # Token-level metrics are weighted by completion length to ensure a fair average over all tokens.
             if self.beta != 0.0:
                 total_kl += mini_batch_metrics['kl'] * mb_completion_length
@@ -1262,6 +1302,14 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self.accelerator.gather_for_metrics(total_clip_ratio / total_completion_length).mean().item())
 
         total_loss = total_loss / total_completion_length
+
+        # Check for numerical instability
+        if not torch.isfinite(total_loss):
+            logger.warning(f"Non-finite loss detected: {total_loss.item()}, resetting to 0")
+            total_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=True)
+        elif total_loss.abs() > 1000.0:  # Extremely high loss
+            logger.warning(f"Extremely high loss detected: {total_loss.item()}, clamping")
+            total_loss = torch.clamp(total_loss, -1000.0, 1000.0)
 
         del inputs, batch_inputs
         if (self.args.torch_empty_cache_steps is not None
